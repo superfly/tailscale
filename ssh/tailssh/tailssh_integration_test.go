@@ -35,7 +35,6 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
-	glider "tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/set"
