@@ -14,13 +14,12 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
+	"tailscale.com/kube/authkey"
 	"tailscale.com/kube/egressservices"
 	"tailscale.com/kube/ingressservices"
 	"tailscale.com/kube/kubeapi"
@@ -169,102 +168,20 @@ func (kc *kubeClient) setAndWaitForAuthKeyReissue(ctx context.Context, client *l
 		return fmt.Errorf("error disconnecting from control: %w", err)
 	}
 
-	err = kc.setReissueAuthKey(ctx, tailscaledConfigAuthKey)
+	err = authkey.SetReissueAuthKey(ctx, kc.Client, kc.stateSecret, tailscaledConfigAuthKey)
 	if err != nil {
 		return fmt.Errorf("failed to set reissue_authkey in Kubernetes Secret: %w", err)
 	}
 
-	err = kc.waitForAuthKeyReissue(ctx, cfg.TailscaledConfigFilePath, tailscaledConfigAuthKey, 10*time.Minute)
+	clearFn := func(ctx context.Context) error {
+		return authkey.ClearReissueAuthKey(ctx, kc.Client, kc.stateSecret)
+	}
+	err = authkey.WaitForAuthKeyReissue(ctx, cfg.TailscaledConfigFilePath, tailscaledConfigAuthKey, 10*time.Minute, clearFn)
 	if err != nil {
 		return fmt.Errorf("failed to receive new auth key: %w", err)
 	}
 
 	return nil
-}
-
-func (kc *kubeClient) setReissueAuthKey(ctx context.Context, authKey string) error {
-	s := &kubeapi.Secret{
-		Data: map[string][]byte{
-			kubetypes.KeyReissueAuthkey: []byte(authKey),
-		},
-	}
-
-	log.Printf("Requesting a new auth key from operator")
-	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, fieldManager)
-}
-
-func (kc *kubeClient) waitForAuthKeyReissue(ctx context.Context, configPath string, oldAuthKey string, maxWait time.Duration) error {
-	log.Printf("Waiting for operator to provide new auth key (max wait: %v)", maxWait)
-
-	ctx, cancel := context.WithTimeout(ctx, maxWait)
-	defer cancel()
-
-	tailscaledCfgDir := filepath.Dir(configPath)
-	toWatch := filepath.Join(tailscaledCfgDir, kubeletMountedConfigLn)
-
-	var (
-		pollTicker <-chan time.Time
-		eventChan  <-chan fsnotify.Event
-	)
-
-	pollInterval := 5 * time.Second
-
-	// Try to use fsnotify for faster notification
-	if w, err := fsnotify.NewWatcher(); err != nil {
-		log.Printf("auth key reissue: fsnotify unavailable, using polling: %v", err)
-	} else if err := w.Add(tailscaledCfgDir); err != nil {
-		w.Close()
-		log.Printf("auth key reissue: fsnotify watch failed, using polling: %v", err)
-	} else {
-		defer w.Close()
-		log.Printf("auth key reissue: watching for config changes via fsnotify")
-		eventChan = w.Events
-	}
-
-	// still keep polling if using fsnotify, for logging and in case fsnotify fails
-	pt := time.NewTicker(pollInterval)
-	defer pt.Stop()
-	pollTicker = pt.C
-
-	start := time.Now()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for auth key reissue after %v", maxWait)
-		case <-pollTicker: // Waits for polling tick, continues when received
-		case event := <-eventChan:
-			if event.Name != toWatch {
-				continue
-			}
-		}
-
-		newAuthKey := authkeyFromTailscaledConfig(configPath)
-		if newAuthKey != "" && newAuthKey != oldAuthKey {
-			log.Printf("New auth key received from operator after %v", time.Since(start).Round(time.Second))
-
-			if err := kc.clearReissueAuthKeyRequest(ctx); err != nil {
-				log.Printf("Warning: failed to clear reissue request: %v", err)
-			}
-
-			return nil
-		}
-
-		if eventChan == nil && pollTicker != nil {
-			log.Printf("Waiting for new auth key from operator (%v elapsed)", time.Since(start).Round(time.Second))
-		}
-	}
-}
-
-// clearReissueAuthKeyRequest removes the reissue_authkey marker from the Secret
-// to signal to the operator that we've successfully received the new key.
-func (kc *kubeClient) clearReissueAuthKeyRequest(ctx context.Context) error {
-	s := &kubeapi.Secret{
-		Data: map[string][]byte{
-			kubetypes.KeyReissueAuthkey: nil,
-		},
-	}
-	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, fieldManager)
 }
 
 // waitForConsistentState waits for tailscaled to finish writing state if it

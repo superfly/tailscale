@@ -38,9 +38,11 @@ import (
 	// we need to import this package so that the `kube:` ipn store gets registered
 	_ "tailscale.com/ipn/store/kubestore"
 	apiproxy "tailscale.com/k8s-operator/api-proxy"
+	"tailscale.com/kube/authkey"
 	"tailscale.com/kube/certs"
 	healthz "tailscale.com/kube/health"
 	"tailscale.com/kube/k8s-proxy/conf"
+	"tailscale.com/kube/kubeclient"
 	"tailscale.com/kube/kubetypes"
 	klc "tailscale.com/kube/localclient"
 	"tailscale.com/kube/metrics"
@@ -171,9 +173,29 @@ func run(logger *zap.SugaredLogger) error {
 
 	// If Pod UID unset, assume we're running outside of a cluster/not managed
 	// by the operator, so no need to set additional state keys.
+	var kc kubeclient.Client
+	var stateSecretName string
 	if podUID != "" {
 		if err := state.SetInitialKeys(st, podUID); err != nil {
 			return fmt.Errorf("error setting initial state: %w", err)
+		}
+
+		// If using kube state store, reset state and set up for auth key reissue.
+		if cfg.Parsed.State != nil && strings.HasPrefix(*cfg.Parsed.State, "kube:") {
+			stateSecretName, err = extractStateSecretName(*cfg.Parsed.State)
+			if err != nil {
+				return err
+			}
+
+			kc, err = newKubeClient(stateSecretName)
+			if err != nil {
+				return err
+			}
+
+			configAuthKey := authkey.AuthKeyFromConfig(configPath)
+			if err := resetState(ctx, kc, stateSecretName, podUID, configAuthKey); err != nil {
+				return fmt.Errorf("error resetting state: %w", err)
+			}
 		}
 	}
 
@@ -209,11 +231,30 @@ func run(logger *zap.SugaredLogger) error {
 		return fmt.Errorf("error getting local client: %w", err)
 	}
 
+	// Check for initial auth failure after ts.Up().
+	if kc != nil && stateSecretName != "" {
+		needsReissue, err := checkInitialAuthState(ctx, lc)
+		if err != nil {
+			return fmt.Errorf("error checking initial auth state: %w", err)
+		}
+		if needsReissue {
+			logger.Info("Auth key missing or invalid after startup, requesting new key from operator")
+			return handleAuthKeyReissue(ctx, lc, kc, stateSecretName, configPath, logger)
+		}
+	}
+
 	// Setup for updating state keys.
 	if podUID != "" {
 		group.Go(func() error {
 			return state.KeepKeysUpdated(ctx, st, klc.New(lc))
 		})
+
+		// Monitor for auth failures during runtime.
+		if kc != nil && stateSecretName != "" {
+			group.Go(func() error {
+				return monitorAuthHealth(ctx, lc, kc, stateSecretName, configPath, logger)
+			})
+		}
 	}
 
 	if cfg.Parsed.HealthCheckEnabled.EqualBool(true) || cfg.Parsed.MetricsEnabled.EqualBool(true) {
