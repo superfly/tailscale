@@ -45,80 +45,92 @@ func (t *target) Build(b *dist.Build) ([]string, error) {
 		return nil, fmt.Errorf("docker not found, cannot build: %w", err)
 	}
 
-	qnapBuilds := getQnapBuilds(b, t.signer)
-	inner, err := qnapBuilds.buildInnerPackage(b, t.goenv)
-	if err != nil {
-		return nil, err
-	}
-
-	return t.buildQPKG(b, qnapBuilds, inner)
+	return getQnapBuildsWithSigner(b, t.signer).buildQPKG(b, t.arch, t.goenv)
 }
 
 const (
 	qnapTag = "1" // currently static, we don't seem to bump this
 )
 
-func (t *target) buildQPKG(b *dist.Build, qnapBuilds *qnapBuilds, inner *innerPkg) ([]string, error) {
-	if _, err := exec.LookPath("docker"); err != nil {
-		return nil, fmt.Errorf("docker not found, cannot build: %w", err)
-	}
+// buildQPKG builds a QPKG for the given architecture. The build is
+// memoized per-arch so that concurrent callers (the individual QPKG
+// target and the repo XML target) share the same build result.
+func (m *qnapBuilds) buildQPKG(b *dist.Build, arch string, goenv map[string]string) ([]string, error) {
+	return m.qpkgOutputs.Do(arch, func() ([]string, error) {
+		if _, err := exec.LookPath("docker"); err != nil {
+			return nil, fmt.Errorf("docker not found, cannot build: %w", err)
+		}
 
-	if err := qnapBuilds.makeDockerImage(b); err != nil {
-		return nil, fmt.Errorf("makeDockerImage: %w", err)
-	}
+		inner, err := m.buildInnerPackage(b, goenv)
+		if err != nil {
+			return nil, err
+		}
 
-	filename := fmt.Sprintf("Tailscale_%s-%s_%s.qpkg", b.Version.Short, qnapTag, t.arch)
-	filePath := filepath.Join(b.Out, filename)
+		if err := m.makeDockerImage(b); err != nil {
+			return nil, fmt.Errorf("makeDockerImage: %w", err)
+		}
 
-	args := []string{"run", "--rm",
-		"--network=host",
-		"-e", fmt.Sprintf("ARCH=%s", t.arch),
-		"-e", fmt.Sprintf("TSTAG=%s", b.Version.Short),
-		"-e", fmt.Sprintf("QNAPTAG=%s", qnapTag),
-		"-v", fmt.Sprintf("%s:/tailscale", inner.tailscalePath),
-		"-v", fmt.Sprintf("%s:/tailscaled", inner.tailscaledPath),
-		// Tailscale folder has QNAP package setup files needed for building.
-		"-v", fmt.Sprintf("%s:/Tailscale", filepath.Join(qnapBuilds.tmpDir, "files/Tailscale")),
-		"-v", fmt.Sprintf("%s:/build-qpkg.sh", filepath.Join(qnapBuilds.tmpDir, "files/scripts/build-qpkg.sh")),
-		"-v", fmt.Sprintf("%s:/out", b.Out),
-	}
+		filename := fmt.Sprintf("Tailscale_%s-%s_%s.qpkg", b.Version.Short, qnapTag, arch)
+		filePath := filepath.Join(b.Out, filename)
 
-	if t.signer != nil {
-		log.Println("Will sign with Google Cloud HSM")
+		args := []string{"run", "--rm",
+			"--network=host",
+			"-e", fmt.Sprintf("ARCH=%s", arch),
+			"-e", fmt.Sprintf("TSTAG=%s", b.Version.Short),
+			"-e", fmt.Sprintf("QNAPTAG=%s", qnapTag),
+			"-v", fmt.Sprintf("%s:/tailscale", inner.tailscalePath),
+			"-v", fmt.Sprintf("%s:/tailscaled", inner.tailscaledPath),
+			// Tailscale folder has QNAP package setup files needed for building.
+			"-v", fmt.Sprintf("%s:/Tailscale", filepath.Join(m.tmpDir, "files/Tailscale")),
+			"-v", fmt.Sprintf("%s:/build-qpkg.sh", filepath.Join(m.tmpDir, "files/scripts/build-qpkg.sh")),
+			"-v", fmt.Sprintf("%s:/out", b.Out),
+		}
+
+		if m.signer != nil {
+			log.Println("Will sign with Google Cloud HSM")
+			args = append(args,
+				"-e", fmt.Sprintf("GCLOUD_CREDENTIALS_BASE64=%s", m.signer.gcloudCredentialsBase64),
+				"-e", fmt.Sprintf("GCLOUD_PROJECT=%s", m.signer.gcloudProject),
+				"-e", fmt.Sprintf("GCLOUD_KEYRING=%s", m.signer.gcloudKeyring),
+				"-e", fmt.Sprintf("QNAP_SIGNING_KEY_NAME=%s", m.signer.keyName),
+				"-e", fmt.Sprintf("QNAP_SIGNING_CERT_BASE64=%s", m.signer.certificateBase64),
+				"-e", fmt.Sprintf("QNAP_SIGNING_CERT_INTERMEDIARIES_BASE64=%s", m.signer.certificateIntermediariesBase64),
+				"-e", fmt.Sprintf("QNAP_SIGNING_SCRIPT=%s", "/sign-qpkg.sh"),
+				"-v", fmt.Sprintf("%s:/sign-qpkg.sh", filepath.Join(m.tmpDir, "files/scripts/sign-qpkg.sh")),
+			)
+		}
+
 		args = append(args,
-			"-e", fmt.Sprintf("GCLOUD_CREDENTIALS_BASE64=%s", t.signer.gcloudCredentialsBase64),
-			"-e", fmt.Sprintf("GCLOUD_PROJECT=%s", t.signer.gcloudProject),
-			"-e", fmt.Sprintf("GCLOUD_KEYRING=%s", t.signer.gcloudKeyring),
-			"-e", fmt.Sprintf("QNAP_SIGNING_KEY_NAME=%s", t.signer.keyName),
-			"-e", fmt.Sprintf("QNAP_SIGNING_CERT_BASE64=%s", t.signer.certificateBase64),
-			"-e", fmt.Sprintf("QNAP_SIGNING_CERT_INTERMEDIARIES_BASE64=%s", t.signer.certificateIntermediariesBase64),
-			"-e", fmt.Sprintf("QNAP_SIGNING_SCRIPT=%s", "/sign-qpkg.sh"),
-			"-v", fmt.Sprintf("%s:/sign-qpkg.sh", filepath.Join(qnapBuilds.tmpDir, "files/scripts/sign-qpkg.sh")),
+			"build.tailscale.io/qdk:latest",
+			"/build-qpkg.sh",
 		)
-	}
 
-	args = append(args,
-		"build.tailscale.io/qdk:latest",
-		"/build-qpkg.sh",
-	)
+		cmd := b.Command(b.Repo, "docker", args...)
 
-	cmd := b.Command(b.Repo, "docker", args...)
+		// dist.Build runs target builds in parallel goroutines by default.
+		// For QNAP, this is an issue because the underlaying qbuild builder will
+		// create tmp directories in the shared docker image that end up conflicting
+		// with one another.
+		// So we use a mutex to only allow one "docker run" at a time.
+		m.dockerImageMu.Lock()
+		defer m.dockerImageMu.Unlock()
 
-	// dist.Build runs target builds in parallel goroutines by default.
-	// For QNAP, this is an issue because the underlaying qbuild builder will
-	// create tmp directories in the shared docker image that end up conflicting
-	// with one another.
-	// So we use a mutex to only allow one "docker run" at a time.
-	qnapBuilds.dockerImageMu.Lock()
-	defer qnapBuilds.dockerImageMu.Unlock()
+		log.Printf("Building %s", filePath)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("docker run %v: %s", err, out)
+		}
 
-	log.Printf("Building %s", filePath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("docker run %v: %s", err, out)
-	}
-
-	return []string{filePath, filePath + ".md5"}, nil
+		ret := []string{filePath, filePath + ".md5"}
+		// If the build was signed, a .codesigning file is produced
+		// containing the signature value needed for QNAP repository
+		// XML <signature> entries.
+		codesigning := filePath + ".codesigning"
+		if _, err := os.Stat(codesigning); err == nil {
+			ret = append(ret, codesigning)
+		}
+		return ret, nil
+	})
 }
 
 type qnapBuildsMemoizeKey struct{}
@@ -132,22 +144,43 @@ type innerPkg struct {
 type qnapBuilds struct {
 	// innerPkgs contains per-goenv compiled binary paths.
 	// It is used to avoid repeated compilations for the same architecture.
-	innerPkgs     dist.Memoize[*innerPkg]
+	innerPkgs dist.Memoize[*innerPkg]
+	// qpkgOutputs memoizes the full QPKG build per architecture.
+	// This ensures that the repo XML target and the individual QPKG
+	// targets share build results without duplicating work.
+	qpkgOutputs   dist.Memoize[[]string]
 	dockerImageMu sync.Mutex
 	// tmpDir is a temp directory used for building qpkgs.
 	// It gets cleaned up when the dist.Build is closed.
 	tmpDir string
+	// signer holds the optional code signing credentials, shared
+	// by all QPKG builds. Set via getQnapBuildsWithSigner.
+	signerOnce sync.Once
+	signer     *signer
 }
 
 // getQnapBuilds returns the qnapBuilds for b, creating one if needed.
-func getQnapBuilds(b *dist.Build, signer *signer) *qnapBuilds {
+func getQnapBuilds(b *dist.Build) *qnapBuilds {
 	return b.Extra(qnapBuildsMemoizeKey{}, func() any {
-		builds, err := newQNAPBuilds(b, signer)
+		builds, err := newQNAPBuilds(b)
 		if err != nil {
 			panic(fmt.Errorf("setUpTmpDir: %v", err))
 		}
 		return builds
 	}).(*qnapBuilds)
+}
+
+// getQnapBuildsWithSigner returns the qnapBuilds for b, setting the
+// signer on first call. The signer is stored on the shared qnapBuilds
+// instance and used by all QPKG builds.
+func getQnapBuildsWithSigner(b *dist.Build, s *signer) *qnapBuilds {
+	qb := getQnapBuilds(b)
+	if s != nil {
+		qb.signerOnce.Do(func() {
+			qb.signer = s
+		})
+	}
+	return qb
 }
 
 //go:embed all:files
@@ -170,7 +203,7 @@ var buildFiles embed.FS
 //
 // When a signer is provided, newQNAPBuilds also sets up the qpkg signature
 // files in qbuild's expected location within m.tmpDir.
-func newQNAPBuilds(b *dist.Build, signer *signer) (*qnapBuilds, error) {
+func newQNAPBuilds(b *dist.Build) (*qnapBuilds, error) {
 	m := new(qnapBuilds)
 
 	log.Print("Setting up qnap tmp build directory")
