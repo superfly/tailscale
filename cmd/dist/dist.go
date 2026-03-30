@@ -53,6 +53,7 @@ func getTargets() ([]dist.Target, error) {
 		return nil, errors.New("all of --gcloud-credentials, --gcloud-project, --gcloud-keyring, --qnap-key-name, --qnap-certificate and --qnap-certificate-intermediaries must be set")
 	}
 	ret = append(ret, qnap.Targets(gcloudCredentialsBase64, gcloudProject, gcloudKeyring, qnapKeyName, qnapCertificateBase64, qnapCertificateIntermediariesBase64)...)
+	ret = append(ret, qnap.RepoXMLTarget())
 	return ret, nil
 }
 
