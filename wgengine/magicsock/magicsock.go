@@ -4317,6 +4317,7 @@ func (c *Conn) HandleDiscoKeyAdvertisement(node tailcfg.NodeView, update packet.
 type NewDiscoKeyAvailable struct {
 	NodeFirstAddr netip.Addr
 	NodeID        tailcfg.NodeID
+	Request       bool
 }
 
 // maybeSendTSMPDiscoAdvert conditionally emits an event indicating that we
@@ -4336,10 +4337,11 @@ func (c *Conn) maybeSendTSMPDiscoAdvert(de *endpoint) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	if !de.sentDiscoKeyAdvertisement {
-		de.sentDiscoKeyAdvertisement = true
+		de.sentDiscoKeyAdvertisement = false
 		c.tsmpDiscoKeyAvailablePub.Publish(NewDiscoKeyAvailable{
 			NodeFirstAddr: de.nodeAddr,
 			NodeID:        de.nodeID,
+			Request:       true,
 		})
 	}
 }
