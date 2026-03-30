@@ -31,6 +31,7 @@ import (
 	"github.com/bramvdbogaerde/go-scp"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/sftp"
+	glider "github.com/tailscale/gliderssh"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"tailscale.com/net/tsdial"
@@ -542,8 +543,9 @@ func testClient(t *testing.T, forceV1Behavior bool, allowSendEnv bool, authMetho
 }
 
 func testServer(t *testing.T, username string, forceV1Behavior bool, allowSendEnv bool) string {
+	varRoot := t.TempDir()
 	srv := &server{
-		lb:             &testBackend{localUser: username, forceV1Behavior: forceV1Behavior, allowSendEnv: allowSendEnv},
+		lb:             &testBackend{localUser: username, forceV1Behavior: forceV1Behavior, allowSendEnv: allowSendEnv, varRoot: varRoot},
 		logf:           log.Printf,
 		tailscaledPath: os.Getenv("TAILSCALED_PATH"),
 		timeNow:        time.Now,
@@ -627,6 +629,7 @@ type testBackend struct {
 	localUser       string
 	forceV1Behavior bool
 	allowSendEnv    bool
+	varRoot         string
 }
 
 func (tb *testBackend) ShouldRunSSH() bool {
@@ -671,7 +674,7 @@ func (tb *testBackend) Dialer() *tsdial.Dialer {
 }
 
 func (tb *testBackend) TailscaleVarRoot() string {
-	return ""
+	return tb.varRoot
 }
 
 func (tb *testBackend) NodeKey() key.NodePublic {

@@ -165,6 +165,7 @@ func (srv *server) HandleSSHConn(nc net.Conn) error {
 	metricIncomingConnections.Add(1)
 	c, err := srv.newConn()
 	if err != nil {
+		nc.Close()
 		return err
 	}
 	srv.trackActiveConn(c, true)        // add
