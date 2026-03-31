@@ -5,6 +5,7 @@ package ipnlocal
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -62,6 +63,7 @@ func init() {
 		RegisterC2N("/debug/logheap", handleC2NDebugLogHeap)
 		RegisterC2N("/debug/netmap", handleC2NDebugNetMap)
 		RegisterC2N("/debug/health", handleC2NDebugHealth)
+		RegisterC2N("/debug/tka", handleC2NDebugTKA)
 	}
 	if runtime.GOOS == "linux" && buildfeatures.HasOSRouter {
 		RegisterC2N("POST /netfilter-kind", handleC2NSetNetfilterKind)
@@ -213,6 +215,33 @@ func handleC2NDebugNetMap(b *LocalBackend, w http.ResponseWriter, r *http.Reques
 	}
 
 	writeJSON(w, resp)
+}
+
+func handleC2NDebugTKA(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasDebug {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
+		return
+	}
+
+	b.logf("c2n: %s %s received", r.Method, r.URL)
+
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil {
+			limit = l
+		}
+	}
+
+	updates, err := b.NetworkLockLog(limit)
+	if errors.Is(err, errNetworkLockNotActive) {
+		http.Error(w, "network lock not active", http.StatusBadRequest)
+		return
+	} else if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get network lock log: %v", err), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, updates)
 }
 
 func handleC2NDebugGoroutines(_ *LocalBackend, w http.ResponseWriter, r *http.Request) {

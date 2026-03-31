@@ -18,6 +18,7 @@ import (
 
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tka"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -28,6 +29,134 @@ import (
 	gcmp "github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 )
+
+func TestHandleC2NDebugTKA(t *testing.T) {
+	makeTKA := func(length int) *tkaState {
+		if length == 0 {
+			return nil
+		}
+
+		disablementSecret := bytes.Repeat([]byte{0xa5}, 32)
+		signerKey := key.NewNLPrivate()
+		key1 := tka.Key{Kind: tka.Key25519, Public: signerKey.Public().Verifier(), Votes: 2}
+
+		chonk := tka.ChonkMem()
+		authority, _, err := tka.Create(chonk, tka.State{
+			Keys:               []tka.Key{key1},
+			DisablementSecrets: [][]byte{tka.DisablementKDF(disablementSecret)},
+		}, signerKey)
+		if err != nil {
+			t.Fatalf("tka.Create() failed: %v", err)
+		}
+
+		for range length - 1 {
+			updater := authority.NewUpdater(signerKey)
+			key2 := tka.Key{Kind: tka.Key25519, Public: key.NewNLPrivate().Public().Verifier(), Votes: 2}
+			updater.AddKey(key2)
+			aums := must.Get(updater.Finalize(chonk))
+			must.Do(authority.Inform(chonk, aums))
+		}
+
+		return &tkaState{
+			authority: authority,
+			storage:   chonk,
+		}
+	}
+
+	t.Run("tailnet-lock-disabled", func(t *testing.T) {
+		b := &LocalBackend{
+			store:   &mem.Store{},
+			varRoot: t.TempDir(),
+			logf:    t.Logf,
+		}
+
+		req := httptest.NewRequest("GET", "/debug/tka", nil)
+		rec := httptest.NewRecorder()
+		b.handleC2N(rec, req)
+
+		if rec.Code != 400 {
+			t.Fatalf("got status code: %v, want: 400\nBody: %s", rec.Code, rec.Body)
+		}
+	})
+
+	t.Run("tailnet-lock-enabled", func(t *testing.T) {
+		b := &LocalBackend{
+			store:   &mem.Store{},
+			varRoot: t.TempDir(),
+			logf:    t.Logf,
+			tka:     makeTKA(2),
+		}
+
+		req := httptest.NewRequest("GET", "/debug/tka", nil)
+		rec := httptest.NewRecorder()
+		b.handleC2N(rec, req)
+
+		if rec.Code != 200 {
+			t.Fatalf("got status code: %v, want: 200\nBody: %s", rec.Code, rec.Body)
+		}
+
+		var got []any
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("couldn't parse JSON: %v\nbody: %s", err, rec.Body)
+		}
+
+		if len(got) != 2 {
+			t.Fatalf("got %d items, want 2", len(got))
+		}
+	})
+
+	t.Run("default-limit", func(t *testing.T) {
+		b := &LocalBackend{
+			store:   &mem.Store{},
+			varRoot: t.TempDir(),
+			logf:    t.Logf,
+			tka:     makeTKA(60),
+		}
+
+		req := httptest.NewRequest("GET", "/debug/tka", nil)
+		rec := httptest.NewRecorder()
+		b.handleC2N(rec, req)
+
+		if rec.Code != 200 {
+			t.Fatalf("got status code: %v, want: 200\nBody: %s", rec.Code, rec.Body)
+		}
+
+		var got []any
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("couldn't parse JSON: %v\nbody: %s", err, rec.Body)
+		}
+
+		if len(got) != 50 {
+			t.Fatalf("got %d items, want 50", len(got))
+		}
+	})
+
+	t.Run("override-limit", func(t *testing.T) {
+		b := &LocalBackend{
+			store:   &mem.Store{},
+			varRoot: t.TempDir(),
+			logf:    t.Logf,
+			tka:     makeTKA(60),
+		}
+
+		req := httptest.NewRequest("GET", "/debug/tka?limit=60", nil)
+		rec := httptest.NewRecorder()
+		b.handleC2N(rec, req)
+
+		if rec.Code != 200 {
+			t.Fatalf("got status code: %v, want: 200\nBody: %s", rec.Code, rec.Body)
+		}
+
+		var got []any
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("couldn't parse JSON: %v\nbody: %s", err, rec.Body)
+		}
+
+		if len(got) != 60 {
+			t.Fatalf("got %d items, want 60", len(got))
+		}
+	})
+}
 
 func TestHandleC2NTLSCertStatus(t *testing.T) {
 	b := &LocalBackend{

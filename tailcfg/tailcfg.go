@@ -181,7 +181,8 @@ type CapabilityVersion int
 //   - 132: 2026-02-13: client respects [NodeAttrDisableHostsFileUpdates]
 //   - 133: 2026-02-17: client understands [NodeAttrForceRegisterMagicDNSIPv4Only]; MagicDNS IPv6 registered w/ OS by default
 //   - 134: 2026-03-09: Client understands [NodeAttrDisableAndroidBindToActiveNetwork]
-const CurrentCapabilityVersion CapabilityVersion = 134
+//   - 135: 2026-03-31: can handle C2N /debug/tka.
+const CurrentCapabilityVersion CapabilityVersion = 135
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
