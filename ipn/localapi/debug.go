@@ -44,6 +44,9 @@ func init() {
 	Register("debug-packet-filter-rules", (*Handler).serveDebugPacketFilterRules)
 	Register("debug-peer-endpoint-changes", (*Handler).serveDebugPeerEndpointChanges)
 	Register("debug-optional-features", (*Handler).serveDebugOptionalFeatures)
+	if buildfeatures.HasCacheNetMap {
+		Register("clear-netmap-cache", (*Handler).serveClearNetmapCache)
+	}
 }
 
 func (h *Handler) serveDebugPeerEndpointChanges(w http.ResponseWriter, r *http.Request) {
@@ -554,4 +557,20 @@ func (h *Handler) serveDebugRotateDiscoKey(w http.ResponseWriter, r *http.Reques
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	io.WriteString(w, "done\n")
+}
+
+func (h *Handler) serveClearNetmapCache(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "debug access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.b.DebugClearNetmapCache(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

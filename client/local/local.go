@@ -1422,3 +1422,10 @@ func (lc *Client) GetAppConnectorRouteInfo(ctx context.Context) (appctype.RouteI
 	}
 	return decodeJSON[appctype.RouteInfo](body)
 }
+
+// ClearNetmapCache instructs the client to discard all cached network map data
+// from profiles for the current user.
+func (lc *Client) ClearNetmapCache(ctx context.Context) error {
+	_, err := lc.send(ctx, "POST", "/localapi/v0/clear-netmap-cache", http.StatusOK, nil)
+	return err
+}
