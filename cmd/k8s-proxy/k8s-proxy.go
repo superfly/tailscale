@@ -31,6 +31,7 @@ import (
 	"k8s.io/utils/strings/slices"
 	"tailscale.com/client/local"
 	"tailscale.com/cmd/k8s-proxy/internal/config"
+	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store"
@@ -38,7 +39,6 @@ import (
 	// we need to import this package so that the `kube:` ipn store gets registered
 	_ "tailscale.com/ipn/store/kubestore"
 	apiproxy "tailscale.com/k8s-operator/api-proxy"
-	"tailscale.com/kube/authkey"
 	"tailscale.com/kube/certs"
 	healthz "tailscale.com/kube/health"
 	"tailscale.com/kube/k8s-proxy/conf"
@@ -180,7 +180,6 @@ func run(logger *zap.SugaredLogger) error {
 			return fmt.Errorf("error setting initial state: %w", err)
 		}
 
-		// If using kube state store, reset state and set up for auth key reissue.
 		if cfg.Parsed.State != nil && strings.HasPrefix(*cfg.Parsed.State, "kube:") {
 			stateSecretName, err = extractStateSecretName(*cfg.Parsed.State)
 			if err != nil {
@@ -192,7 +191,10 @@ func run(logger *zap.SugaredLogger) error {
 				return err
 			}
 
-			configAuthKey := authkey.AuthKeyFromConfig(configPath)
+			var configAuthKey string
+			if cfg.Parsed.AuthKey != nil {
+				configAuthKey = *cfg.Parsed.AuthKey
+			}
 			if err := resetState(ctx, kc, stateSecretName, podUID, configAuthKey); err != nil {
 				return fmt.Errorf("error resetting state: %w", err)
 			}
@@ -219,19 +221,46 @@ func run(logger *zap.SugaredLogger) error {
 		ts.Hostname = *cfg.Parsed.Hostname
 	}
 
-	// Make sure we crash loop if Up doesn't complete in reasonable time.
-	upCtx, upCancel := context.WithTimeout(ctx, time.Minute)
-	defer upCancel()
-	if _, err := ts.Up(upCtx); err != nil {
-		return fmt.Errorf("error starting tailscale server: %w", err)
-	}
-	defer ts.Close()
 	lc, err := ts.LocalClient()
 	if err != nil {
 		return fmt.Errorf("error getting local client: %w", err)
 	}
 
-	// Check for initial auth failure after ts.Up().
+	// Make sure we crash loop if Up doesn't complete in reasonable time.
+	upCtx, upCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer upCancel()
+
+	go func() {
+		w, err := lc.WatchIPNBus(upCtx, ipn.NotifyInitialHealthState)
+		if err != nil {
+			return
+		}
+		defer w.Close()
+		for {
+			n, err := w.Next()
+			if err != nil {
+				return
+			}
+			if n.Health != nil {
+				if _, ok := n.Health.Warnings[health.LoginStateWarnable.Code]; ok {
+					upCancel()
+					return
+				}
+			}
+		}
+	}()
+
+	_, upErr := ts.Up(upCtx)
+	if upErr != nil {
+		if kc != nil && stateSecretName != "" {
+			clearTailscaledState(ctx, kc, stateSecretName)
+			return handleAuthKeyReissue(ctx, lc, kc, stateSecretName, authKey, cfgChan, logger)
+		}
+		return upErr
+	}
+
+	defer ts.Close()
+
 	if kc != nil && stateSecretName != "" {
 		needsReissue, err := checkInitialAuthState(ctx, lc)
 		if err != nil {
@@ -239,20 +268,18 @@ func run(logger *zap.SugaredLogger) error {
 		}
 		if needsReissue {
 			logger.Info("Auth key missing or invalid after startup, requesting new key from operator")
-			return handleAuthKeyReissue(ctx, lc, kc, stateSecretName, configPath, logger)
+			return handleAuthKeyReissue(ctx, lc, kc, stateSecretName, authKey, cfgChan, logger)
 		}
 	}
 
-	// Setup for updating state keys.
 	if podUID != "" {
 		group.Go(func() error {
 			return state.KeepKeysUpdated(ctx, st, klc.New(lc))
 		})
 
-		// Monitor for auth failures during runtime.
 		if kc != nil && stateSecretName != "" {
 			group.Go(func() error {
-				return monitorAuthHealth(ctx, lc, kc, stateSecretName, configPath, logger)
+				return monitorAuthHealth(ctx, lc, kc, stateSecretName, cfgChan, configPath, authKey, logger)
 			})
 		}
 	}
