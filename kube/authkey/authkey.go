@@ -17,10 +17,9 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"tailscale.com/ipn/conffile"
 	"tailscale.com/kube/kubeapi"
 	"tailscale.com/kube/kubeclient"
@@ -28,8 +27,7 @@ import (
 )
 
 const (
-	fieldManager           = "tailscale-container"
-	kubeletMountedConfigLn = "..data"
+	fieldManager = "tailscale-container"
 )
 
 // SetReissueAuthKey sets the reissue_authkey marker in the state Secret to
@@ -49,53 +47,48 @@ func SetReissueAuthKey(ctx context.Context, kc kubeclient.Client, stateSecretNam
 // ClearReissueAuthKey removes the reissue_authkey marker from the state Secret
 // to signal to the operator that we've successfully received the new key.
 func ClearReissueAuthKey(ctx context.Context, kc kubeclient.Client, stateSecretName string) error {
+	existing, err := kc.GetSecret(ctx, stateSecretName)
+	if err != nil {
+		return fmt.Errorf("error getting state secret: %w", err)
+	}
+
 	s := &kubeapi.Secret{
 		Data: map[string][]byte{
 			kubetypes.KeyReissueAuthkey: nil,
+			kubetypes.KeyDeviceID:       nil,
+			kubetypes.KeyDeviceFQDN:     nil,
+			kubetypes.KeyDeviceIPs:      nil,
 		},
 	}
+
+	// Clear tsnet profile state so the new auth key is used on next boot.
+	for k := range existing.Data {
+		switch {
+		case k == "_machinekey", k == "_current-profile", k == "_known-profiles":
+			s.Data[k] = nil
+		case strings.HasPrefix(k, "profile-"):
+			s.Data[k] = nil
+		}
+	}
+
 	return kc.StrategicMergePatchSecret(ctx, stateSecretName, s, fieldManager)
 }
 
-// WaitForAuthKeyReissue watches the config file for a new auth key different
-// from oldAuthKey. It uses fsnotify when available for fast notification, with
-// a polling fallback for logging and reliability. Returns when a new key is
-// detected or maxWait expires.
-//
-// The clearFn callback is called when a new key is detected, to clear the
-// reissue marker from the state Secret.
-func WaitForAuthKeyReissue(ctx context.Context, configPath string, oldAuthKey string, maxWait time.Duration, clearFn func(context.Context) error) error {
+// WaitForAuthKeyReissue polls getAuthKey for a new auth key different from
+// oldAuthKey, returning when one is found or maxWait expires. If notify is
+// non-nil, it is used to wake the loop on config changes; otherwise it falls
+// back to periodic polling. The clearFn callback is called when a new key is
+// detected, to clear the reissue marker from the state Secret.
+func WaitForAuthKeyReissue(ctx context.Context, oldAuthKey string, maxWait time.Duration, getAuthKey func() string, clearFn func(context.Context) error,
+	notify <-chan struct{}) error {
 	log.Printf("Waiting for operator to provide new auth key (max wait: %v)", maxWait)
 
 	ctx, cancel := context.WithTimeout(ctx, maxWait)
 	defer cancel()
 
-	tailscaledCfgDir := filepath.Dir(configPath)
-	toWatch := filepath.Join(tailscaledCfgDir, kubeletMountedConfigLn)
-
-	var (
-		pollTicker <-chan time.Time
-		eventChan  <-chan fsnotify.Event
-	)
-
 	pollInterval := 5 * time.Second
-
-	// Try to use fsnotify for faster notification
-	if w, err := fsnotify.NewWatcher(); err != nil {
-		log.Printf("auth key reissue: fsnotify unavailable, using polling: %v", err)
-	} else if err := w.Add(tailscaledCfgDir); err != nil {
-		w.Close()
-		log.Printf("auth key reissue: fsnotify watch failed, using polling: %v", err)
-	} else {
-		defer w.Close()
-		log.Printf("auth key reissue: watching for config changes via fsnotify")
-		eventChan = w.Events
-	}
-
-	// still keep polling if using fsnotify, for logging and in case fsnotify fails
 	pt := time.NewTicker(pollInterval)
 	defer pt.Stop()
-	pollTicker = pt.C
 
 	start := time.Now()
 
@@ -103,25 +96,20 @@ func WaitForAuthKeyReissue(ctx context.Context, configPath string, oldAuthKey st
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for auth key reissue after %v", maxWait)
-		case <-pollTicker: // Waits for polling tick, continues when received
-		case event := <-eventChan:
-			if event.Name != toWatch {
-				continue
-			}
+		case <-pt.C:
+		case <-notify:
 		}
 
-		newAuthKey := AuthKeyFromConfig(configPath)
+		newAuthKey := getAuthKey()
 		if newAuthKey != "" && newAuthKey != oldAuthKey {
 			log.Printf("New auth key received from operator after %v", time.Since(start).Round(time.Second))
-
 			if err := clearFn(ctx); err != nil {
 				log.Printf("Warning: failed to clear reissue request: %v", err)
 			}
-
 			return nil
 		}
 
-		if eventChan == nil && pollTicker != nil {
+		if notify == nil {
 			log.Printf("Waiting for new auth key from operator (%v elapsed)", time.Since(start).Round(time.Second))
 		}
 	}
