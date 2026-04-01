@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/kube/authkey"
@@ -141,9 +143,6 @@ func (kc *kubeClient) resetContainerbootState(ctx context.Context, podUID string
 			kubetypes.KeyCapVer: fmt.Appendf(nil, "%d", tailcfg.CurrentCapabilityVersion),
 
 			// TODO(tomhjp): Perhaps shouldn't clear device ID and use a different signal, as this could leak tailnet devices.
-			kubetypes.KeyDeviceID:            nil,
-			kubetypes.KeyDeviceFQDN:          nil,
-			kubetypes.KeyDeviceIPs:           nil,
 			kubetypes.KeyHTTPSEndpoint:       nil,
 			egressservices.KeyEgressServices: nil,
 			ingressservices.IngressConfigKey: nil,
@@ -176,7 +175,33 @@ func (kc *kubeClient) setAndWaitForAuthKeyReissue(ctx context.Context, client *l
 	clearFn := func(ctx context.Context) error {
 		return authkey.ClearReissueAuthKey(ctx, kc.Client, kc.stateSecret)
 	}
-	err = authkey.WaitForAuthKeyReissue(ctx, cfg.TailscaledConfigFilePath, tailscaledConfigAuthKey, 10*time.Minute, clearFn)
+
+	getAuthKey := func() string { return authkey.AuthKeyFromConfig(cfg.TailscaledConfigFilePath) }
+	tailscaledCfgDir := filepath.Dir(cfg.TailscaledConfigFilePath)
+	var notify <-chan struct{}
+	if w, err := fsnotify.NewWatcher(); err != nil {
+		log.Printf("auth key reissue: fsnotify unavailable, using polling: %v", err)
+	} else if err := w.Add(tailscaledCfgDir); err != nil {
+		w.Close()
+		log.Printf("auth key reissue: fsnotify watch failed, using polling: %v", err)
+	} else {
+		defer w.Close()
+		ch := make(chan struct{}, 1)
+		toWatch := filepath.Join(tailscaledCfgDir, "..data")
+		go func() {
+			for ev := range w.Events {
+				if ev.Name == toWatch {
+					select {
+					case ch <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}()
+		notify = ch
+	}
+
+	err = authkey.WaitForAuthKeyReissue(ctx, tailscaledConfigAuthKey, 10*time.Minute, getAuthKey, clearFn, notify)
 	if err != nil {
 		return fmt.Errorf("failed to receive new auth key: %w", err)
 	}
