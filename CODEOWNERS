@@ -1,1 +1,4 @@
+# Fly.io owners first; upstream entries below are kept for reference.
+* @superfly/infra-ops
+
 /tailcfg/ @tailscale/control-protocol-owners
